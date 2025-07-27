@@ -1,111 +1,115 @@
-`timescale 1ns/1ps
-
-module ecc_memory (
-    input wire clk,
-    input wire rst_n,
-    input wire en,
-    input wire wr_en,
-    input wire [7:0] addr,
-    input wire [3:0] data_in,
-    input wire [2:0] ecc_in,
-    output logic [3:0] data_out,
-    output logic [2:0] ecc_out,
-    output logic error_detected,
-    output logic error_corrected
+module bch_decoder_15_5 (
+    input  logic [14:0] codeword_in,
+    output logic [4:0]  data_out,
+    output logic        error_detected,
+    output logic        error_corrected,
+    output logic [14:0] corrected_codeword,
+    output logic [9:0]  syndrome
 );
-    // Memory array with ECC protection (Hamming 7,4)
-    typedef struct packed {
-        logic [3:0] data;
-        logic [2:0] ecc;
-    } mem_entry_t;
+    localparam logic [10:0] generator = 11'b10100110111;  // G(x) of (15,5) BCH
+    logic [14:0] trial;
+    integer i, j;
+    logic found;  // control flag
     
-    mem_entry_t memory [0:255];
-    
-    // Hamming (7,4) encode
-    function automatic logic [2:0] generate_ecc(input logic [3:0] data);
-        logic [2:0] ecc;
-        // Parity bit positions: p0, p1, p2
-        // Data bit positions: d0, d1, d2, d3
-        // Codeword: [p0 p1 d0 p2 d1 d2 d3] (bit 6:0)
-        ecc[0] = data[0] ^ data[1] ^ data[3]; // p0
-        ecc[1] = data[0] ^ data[2] ^ data[3]; // p1
-        ecc[2] = data[1] ^ data[2] ^ data[3]; // p2
-        return ecc;
-    endfunction
-
-    // Hamming (7,4) decode and correct
-    function automatic mem_entry_t correct_errors(
-        input logic [3:0] data,
-        input logic [2:0] ecc
-    );
-        mem_entry_t corrected;
-        logic [2:0] syndrome;
-        logic [6:0] codeword;
-        // Assemble codeword: [p0 p1 d0 p2 d1 d2 d3]
-        codeword[6] = data[3];
-        codeword[5] = data[2];
-        codeword[4] = data[1];
-        codeword[3] = ecc[2];
-        codeword[2] = data[0];
-        codeword[1] = ecc[1];
-        codeword[0] = ecc[0];
-        // Syndrome calculation
-        syndrome[0] = codeword[0] ^ codeword[2] ^ codeword[4] ^ codeword[6];
-        syndrome[1] = codeword[1] ^ codeword[2] ^ codeword[5] ^ codeword[6];
-        syndrome[2] = codeword[3] ^ codeword[4] ^ codeword[5] ^ codeword[6];
-        corrected.data = data;
-        corrected.ecc = ecc;
-        if (syndrome != 0) begin
-            // Single-bit error detected, correct it
-            int err_pos = {syndrome[2], syndrome[1], syndrome[0]};
-            if (err_pos < 7) begin
-                codeword[err_pos] = ~codeword[err_pos];
+    // Syndrome calculator function
+    function automatic logic [9:0] compute_syndrome(input logic [14:0] cw);
+        logic [14:0] dividend = cw;
+        for (int k = 14; k >= 10; k--) begin
+            if (dividend[k]) begin
+                for (int b = 0; b < 11; b++) begin
+                    dividend[k - b] ^= generator[10 - b];
+                end
             end
         end
-        // Extract corrected data and ecc
-        corrected.data[3] = codeword[6];
-        corrected.data[2] = codeword[5];
-        corrected.data[1] = codeword[4];
-        corrected.data[0] = codeword[2];
-        corrected.ecc[2] = codeword[3];
-        corrected.ecc[1] = codeword[1];
-        corrected.ecc[0] = codeword[0];
-        return corrected;
+        return dividend[9:0];
     endfunction
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            foreach (memory[i]) begin
-                memory[i].data <= '0;
-                memory[i].ecc <= '0;
+    
+    always_comb begin
+        data_out         = codeword_in[14:10];
+        error_detected   = 0;
+        error_corrected  = 0;
+        corrected_codeword = codeword_in;
+        syndrome         = compute_syndrome(codeword_in);
+        found            = 0;
+        
+        if (syndrome != 10'b0) begin
+            error_detected = 1;
+            
+            // Try 1-bit error correction
+            for (i = 0; i < 15; i++) begin
+                trial = codeword_in;
+                trial[i] ^= 1'b1;
+                if (compute_syndrome(trial) == 10'b0) begin
+                    corrected_codeword = trial;
+                    data_out = trial[14:10];
+                    error_corrected = 1;
+                    found = 1;
+                    break;
+                end
             end
-            data_out <= '0;
-            ecc_out <= '0;
-            error_detected <= 0;
-            error_corrected <= 0;
-        end else if (en) begin
-            if (wr_en) begin
-                memory[addr].data <= data_in;
-                memory[addr].ecc <= generate_ecc(data_in);
-                data_out <= '0;
-                ecc_out <= '0;
-                error_detected <= 0;
-                error_corrected <= 0;
-            end else begin
-                mem_entry_t corrected;
-                logic [2:0] calc_ecc;
-                logic [2:0] syndrome_dbg;
-                calc_ecc = generate_ecc(memory[addr].data);
-                corrected = correct_errors(memory[addr].data, memory[addr].ecc);
-                syndrome_dbg = calc_ecc ^ memory[addr].ecc;
-                data_out <= corrected.data;
-                ecc_out <= corrected.ecc;
-                error_detected <= (calc_ecc != memory[addr].ecc);
-                error_corrected <= (corrected.data != memory[addr].data || corrected.ecc != memory[addr].ecc);
-                if (error_corrected)
-                    memory[addr] <= corrected;
-                $display("READ: addr=%h data=%b ecc=%b corrected_data=%b corrected_ecc=%b syndrome=%b error_detected=%b error_corrected=%b", addr, memory[addr].data, memory[addr].ecc, corrected.data, corrected.ecc, syndrome_dbg, error_detected, error_corrected);
+            
+            // Try 2-bit error correction (if not already corrected)
+            if (!found) begin
+                for (i = 0; i < 14 && !found; i++) begin
+                    for (j = i + 1; j < 15 && !found; j++) begin
+                        trial = codeword_in;
+                        trial[i] ^= 1'b1;
+                        trial[j] ^= 1'b1;
+                        if (compute_syndrome(trial) == 10'b0) begin
+                            corrected_codeword = trial;
+                            data_out = trial[14:10];
+                            error_corrected = 1;
+                            found = 1;
+                        end
+                    end
+                end
             end
         end
+    end
+endmodule
+
+module bch_encoder_15_5 (
+    input  logic [4:0]  data_in,
+    output logic [14:0] codeword
+);
+    localparam logic [10:0] generator = 11'b10100110111;
+    logic [14:0] temp;
+    integer i;
+    
+    always_comb begin
+        // Initialize dividend with data_in and 10 zero bits
+        temp = {data_in, 10'b0};
+        
+        // Perform modulo-2 division
+        for (i = 14; i >= 10; i--) begin
+            if (temp[i]) begin
+                temp[i -: 11] ^= generator;
+            end
+        end
+        
+        // Append remainder to original data
+        codeword = {data_in, temp[9:0]};
+    end
+endmodule
+// Code your design here
+module hamming_encoder_7_4 (
+    input  logic [3:0] data_in,
+    output logic [6:0] codeword
+);
+    logic p1, p2, p4;  // Parity bits
+    
+    always_comb begin
+        // Calculate parity bits
+        // P1 covers positions 1,3,5,7 (bits 0,2,4,6 in 0-indexed)
+        p1 = data_in[0] ^ data_in[1] ^ data_in[3];
+        
+        // P2 covers positions 2,3,6,7 (bits 1,2,5,6 in 0-indexed)  
+        p2 = data_in[0] ^ data_in[2] ^ data_in[3];
+        
+        // P4 covers positions 4,5,6,7 (bits 3,4,5,6 in 0-indexed)
+        p4 = data_in[1] ^ data_in[2] ^ data_in[3];
+        
+        // Construct codeword: [d3 d2 d1 p4 d0 p2 p1]
+        codeword = {data_in[3], data_in[2], data_in[1], p4, data_in[0], p2, p1};
     end
 endmodule
